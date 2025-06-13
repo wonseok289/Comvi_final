@@ -1,3 +1,7 @@
+natsort==8.4.0
+jupyter
+ipykernel
+ipywidgets
 torch
 torchvision
 opencv-python>=4.5.1
