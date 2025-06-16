@@ -6,7 +6,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 
 def Make_Optimizer(model):
-    magic = "sgd"
+    magic = "adamw"
     
     if magic == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
@@ -18,7 +18,7 @@ def Make_Optimizer(model):
         optimizer = torch.optim.SGD(model.parameters(), lr=0.02, momentum=0.9, weight_decay=1e-4)
         
     elif magic == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
         
     elif magic == "baseline":
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -32,7 +32,7 @@ def Make_LR_Scheduler(optimizer):
     magic = "warmup_cosine"
     
     if magic == "warmup_cosine":
-        lr_scheduler = WarmupCosineLR(optimizer, T_max = 30, warmup_iters = 2, eta_min = 1e-6)
+        lr_scheduler = WarmupCosineLR(optimizer, T_max = 30, warmup_iters = 2, warmup_factor=0.1, eta_min = 1e-6)
         
     elif magic == "warmup_poly":
         lr_scheduler = WarmupPolyLR(optimizer, T_max = 30, warmup_iters = 2, eta_min = 1e-6, power = 0.9)
@@ -46,6 +46,7 @@ def Make_LR_Scheduler(optimizer):
     else:
         raise ValueError(f"Unsupported lr scheduler: {magic}. Use 'cosine' or 'constant'.")
     return lr_scheduler
+
 
 
 def Make_Loss_Function(number_of_classes):
