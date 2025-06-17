@@ -2,81 +2,82 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class DepthwiseSeparableConv(nn.Module):
+    """Dilation을 지원하는 경량 합성곱 블록"""
+    def __init__(self, in_channels, out_channels, stride=1, dilation=1):
+        super(DepthwiseSeparableConv, self).__init__()
+        # Dilation에 맞는 패딩 계산
+        padding = dilation
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=False)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.bn(self.pointwise(self.depthwise(x))))
+
+class MicroASPP(nn.Module):
+    """다양한 스케일의 특징을 포착하기 위한 초소형 ASPP 모듈"""
+    def __init__(self, in_channels, out_channels):
+        super(MicroASPP, self).__init__()
+        inter_channels = in_channels // 4
+        
+        # 병렬 브랜치: 1x1 conv, dilated conv, global pooling
+        self.branch1x1 = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 1, bias=False), nn.BatchNorm2d(inter_channels), nn.ReLU())
+        self.branch_dil_2 = DepthwiseSeparableConv(in_channels, inter_channels, dilation=2)
+        self.branch_dil_4 = DepthwiseSeparableConv(in_channels, inter_channels, dilation=4)
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_channels, inter_channels, 1, bias=False), nn.BatchNorm2d(inter_channels), nn.ReLU())
+        
+        # 모든 브랜치의 출력을 합친 후 1x1 Conv로 채널 조정
+        self.conv_cat = nn.Sequential(nn.Conv2d(inter_channels * 4, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU())
+
+    def forward(self, x):
+        h, w = x.size()[2], x.size()[3]
+        
+        b1 = self.branch1x1(x)
+        b2 = self.branch_dil_2(x)
+        b3 = self.branch_dil_4(x)
+        b_pool = F.interpolate(self.pool(x), size=(h, w), mode='bilinear', align_corners=True)
+        
+        out = torch.cat([b1, b2, b3, b_pool], dim=1)
+        return self.conv_cat(out)
+
 class submission_20224258(nn.Module):
-    """LCNet 원칙에 기반한 초경량(<20k) 이중 경로 모델"""
+    """ASPP를 탑재한 최종 초경량 모델 (< 2,000 params)"""
     def __init__(self, in_channels=3, num_classes=1):
         super(submission_20224258, self).__init__()
         self.num_classes = 1 if num_classes == 1 else num_classes
 
-        # Stem Layer
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 8, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(8),
-            nn.ReLU(inplace=True)
-        )
-
         # Encoder
-        self.enc1 = DepthwiseSeparableConv(8, 16, stride=2)
-        self.enc2 = nn.Sequential(
-            DepthwiseSeparableConv(16, 32, stride=2),
-            SEBlock(32)  # SE-Block 추가로 특징 강조
-        )
-
+        self.enc1 = DepthwiseSeparableConv(in_channels, 8, stride=2)
+        self.enc2 = DepthwiseSeparableConv(8, 16, stride=2)
+        
+        # Bottleneck with Micro-ASPP
+        self.aspp = MicroASPP(16, 16)
+        
         # Decoder
-        self.dec1 = DepthwiseSeparableConv(32, 16)
-        self.dec2 = DepthwiseSeparableConv(16, 8)
-
-        # Final Classifier
-        self.out_conv = nn.Conv2d(8, self.num_classes, kernel_size=1, bias=False)
+        self.dec1 = DepthwiseSeparableConv(16 + 8, 8) # Skip-connection (enc1 + up_b)
+        
+        # Output Layer
+        self.final_conv = nn.Conv2d(8, self.num_classes, kernel_size=1)
 
     def forward(self, x):
+        H, W = x.size()[2:]
+
         # Encoder
-        s_out = self.stem(x)
-        enc1_out = self.enc1(s_out)
-        enc2_out = self.enc2(enc1_out)
-
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        
+        # Bottleneck
+        b = self.aspp(e2)
+        
         # Decoder
-        dec1_out = F.interpolate(enc2_out, size=enc1_out.size()[2:], mode='bilinear', align_corners=True)
-        dec1_out = self.dec1(dec1_out)
-
-        dec2_out = F.interpolate(dec1_out, size=s_out.size()[2:], mode='bilinear', align_corners=True)
-        dec2_out = self.dec2(dec2_out)
-
-        # Final Output
-        out = F.interpolate(dec2_out, size=x.size()[2:], mode='bilinear', align_corners=True)
-        out = self.out_conv(out)
+        d1 = F.interpolate(b, size=e1.size()[2:], mode='bilinear', align_corners=True)
+        d1 = torch.cat([e1, d1], dim=1) # Skip Connection
+        d1 = self.dec1(d1)
+        
+        # Final Upsampling and Output
+        out = F.interpolate(d1, size=(H, W), mode='bilinear', align_corners=True)
+        out = self.final_conv(out)
         
         return out
-
-class DepthwiseSeparableConv(nn.Module):
-    """Depthwise Separable Convolution: 파라미터 효율성을 위한 블록"""
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(DepthwiseSeparableConv, self).__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, padding=1, groups=in_channels, bias=False)
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu2 = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.relu2(self.bn2(self.pointwise(self.relu1(self.bn1(self.depthwise(x))))))
-
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation Block: 채널별 중요도 학습 모듈"""
-    def __init__(self, in_channels, reduction=4):
-        super(SEBlock, self).__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction, in_channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
-
