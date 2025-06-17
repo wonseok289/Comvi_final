@@ -3,62 +3,74 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DepthwiseSeparableConv(nn.Module):
-    """Dilation을 지원하는 경량 합성곱 블록"""
     def __init__(self, in_channels, out_channels, stride=1, dilation=1):
         super(DepthwiseSeparableConv, self).__init__()
-        # Dilation에 맞는 패딩 계산
         padding = dilation
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=False)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, stride, padding, dilation=dilation, groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
     def forward(self, x):
-        return self.relu(self.bn(self.pointwise(self.depthwise(x))))
+        return self.conv(x)
 
 class MicroASPP(nn.Module):
-    """다양한 스케일의 특징을 포착하기 위한 초소형 ASPP 모듈"""
     def __init__(self, in_channels, out_channels):
         super(MicroASPP, self).__init__()
         inter_channels = in_channels // 4
-        
-        # 병렬 브랜치: 1x1 conv, dilated conv, global pooling
-        self.branch1x1 = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 1, bias=False), nn.BatchNorm2d(inter_channels), nn.ReLU())
-        self.branch_dil_2 = DepthwiseSeparableConv(in_channels, inter_channels, dilation=2)
-        self.branch_dil_4 = DepthwiseSeparableConv(in_channels, inter_channels, dilation=4)
+        self.branch1 = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 1, bias=False), nn.BatchNorm2d(inter_channels), nn.ReLU())
+        self.branch2 = DepthwiseSeparableConv(in_channels, inter_channels, dilation=2)
+        self.branch3 = DepthwiseSeparableConv(in_channels, inter_channels, dilation=4)
         self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_channels, inter_channels, 1, bias=False), nn.BatchNorm2d(inter_channels), nn.ReLU())
-        
-        # 모든 브랜치의 출력을 합친 후 1x1 Conv로 채널 조정
         self.conv_cat = nn.Sequential(nn.Conv2d(inter_channels * 4, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU())
 
     def forward(self, x):
-        h, w = x.size()[2], x.size()[3]
-        
-        b1 = self.branch1x1(x)
-        b2 = self.branch_dil_2(x)
-        b3 = self.branch_dil_4(x)
+        h, w = x.size(2), x.size(3)
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
         b_pool = F.interpolate(self.pool(x), size=(h, w), mode='bilinear', align_corners=True)
-        
         out = torch.cat([b1, b2, b3, b_pool], dim=1)
         return self.conv_cat(out)
 
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        # *** 오류 수정: 입력 채널 수를 정확히 계산 ***
+        self.conv = DepthwiseSeparableConv(in_channels + skip_channels, out_channels)
+
+    def forward(self, x, skip_feature):
+        x = self.up(x)
+        x = torch.cat([x, skip_feature], dim=1)
+        return self.conv(x)
+
 class submission_20224258(nn.Module):
-    """ASPP를 탑재한 최종 초경량 모델 (< 2,000 params)"""
     def __init__(self, in_channels=3, num_classes=1):
         super(submission_20224258, self).__init__()
         self.num_classes = 1 if num_classes == 1 else num_classes
 
         # Encoder
-        self.enc1 = DepthwiseSeparableConv(in_channels, 8, stride=2)
-        self.enc2 = DepthwiseSeparableConv(8, 16, stride=2)
-        
-        # Bottleneck with Micro-ASPP
-        self.aspp = MicroASPP(16, 16)
-        
+        self.enc1 = DepthwiseSeparableConv(in_channels, 16)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = DepthwiseSeparableConv(16, 32)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = DepthwiseSeparableConv(32, 64)
+        self.pool3 = nn.MaxPool2d(2)
+
+        # Bottleneck with ASPP
+        self.bottleneck = MicroASPP(64, 64)
+
         # Decoder
-        self.dec1 = DepthwiseSeparableConv(16 + 8, 8) # Skip-connection (enc1 + up_b)
+        # *** 오류 수정: skip_channels 크기를 올바르게 지정 ***
+        self.dec3 = DecoderBlock(64, 64, 32)
+        self.dec2 = DecoderBlock(32, 32, 16)
+        self.dec1 = DecoderBlock(16, 16, 8)
         
-        # Output Layer
+        # Final Classifier
         self.final_conv = nn.Conv2d(8, self.num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -66,17 +78,22 @@ class submission_20224258(nn.Module):
 
         # Encoder
         e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        
+        p1 = self.pool1(e1)
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+        e3 = self.enc3(p2)
+        p3 = self.pool3(e3)
+
         # Bottleneck
-        b = self.aspp(e2)
-        
+        b = self.bottleneck(p3)
+
         # Decoder
-        d1 = F.interpolate(b, size=e1.size()[2:], mode='bilinear', align_corners=True)
-        d1 = torch.cat([e1, d1], dim=1) # Skip Connection
-        d1 = self.dec1(d1)
+        # *** 오류 수정: DecoderBlock을 통해 업샘플링과 특징 융합을 한번에 처리 ***
+        d3 = self.dec3(b, e3)
+        d2 = self.dec2(d3, e2)
+        d1 = self.dec1(d2, e1)
         
-        # Final Upsampling and Output
+        # Final Output
         out = F.interpolate(d1, size=(H, W), mode='bilinear', align_corners=True)
         out = self.final_conv(out)
         

@@ -29,7 +29,7 @@ def Make_Optimizer(model):
 
 
 def Make_LR_Scheduler(optimizer):
-    magic = "constant"
+    magic = "warmup_cosine"
     
     if magic == "warmup_cosine":
         lr_scheduler = WarmupCosineLR(optimizer, T_max = 30, warmup_iters = 2,  eta_min = 1e-6)
