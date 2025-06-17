@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# --- Helper Modules ---
+
 class ConvBNReLU(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super(ConvBNReLU, self).__init__()
@@ -29,10 +31,26 @@ class DepthwiseSeparableConv(nn.Module):
         x = self.relu2(self.bn2(self.pointwise(x)))
         return x
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation Block for channel-wise attention"""
+    def __init__(self, channels, reduction=4):
+        super(SEBlock, self).__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=False),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+# --- Main Model: Lightweight U-Net with SE-Block ---
+
 class submission_20224258(nn.Module):
-    """
-    파라미터 20,000개 미만을 보장하는 최종 경량 U-Net
-    """
     def __init__(self, in_channels=3, num_classes=1):
         super(submission_20224258, self).__init__()
         self.num_classes = 1 if num_classes == 2 else num_classes
@@ -41,7 +59,12 @@ class submission_20224258(nn.Module):
         self.enc_stem = ConvBNReLU(in_channels, 16, stride=2)
         self.enc1 = DepthwiseSeparableConv(16, 24, stride=2)
         self.enc2 = DepthwiseSeparableConv(24, 32, stride=2)
-        self.bottleneck = DepthwiseSeparableConv(32, 48, stride=2)
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            DepthwiseSeparableConv(32, 48, stride=2),
+            SEBlock(48) # Bottleneck에 SE-Block 추가
+        )
 
         # Decoder
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
@@ -54,7 +77,7 @@ class submission_20224258(nn.Module):
         self.dec1 = DepthwiseSeparableConv(24 + 16, 16) # Concat with stem
         
         self.up0 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec0 = DepthwiseSeparableConv(16, 8)     # No skip connection from original input
+        self.dec0 = DepthwiseSeparableConv(16, 8)
 
         # Final Classifier
         self.classifier = nn.Conv2d(8, self.num_classes, kernel_size=1)
